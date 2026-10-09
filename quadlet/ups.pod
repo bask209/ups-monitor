@@ -1,0 +1,6 @@
+[Pod]
+PodName=ups
+PublishPort=8330:8330
+
+[Install]
+WantedBy=default.target

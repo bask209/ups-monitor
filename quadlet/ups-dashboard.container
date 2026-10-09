@@ -1,0 +1,30 @@
+[Unit]
+Description=UPS dashboard, history and Telegram alerts
+After=ups-nut.service
+Wants=ups-nut.service
+
+[Container]
+ContainerName=ups-dashboard
+Image=localhost/ups-monitor:latest
+Pull=never
+Pod=ups.pod
+EnvironmentFile=%h/ups-monitor/.env
+Volume=%h/ups-monitor/data:/data:Z
+ReadOnly=true
+Tmpfs=/tmp
+NoNewPrivileges=true
+DropCapability=all
+HealthCmd=python -c "import urllib.request as u;u.urlopen('http://127.0.0.1:8330/api/health',timeout=5)"
+HealthInterval=30s
+HealthTimeout=10s
+HealthRetries=3
+HealthStartPeriod=60s
+HealthOnFailure=kill
+PodmanArgs=--memory=256m --pids-limit=64
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

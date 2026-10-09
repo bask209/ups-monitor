@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UPS Monitor</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#14181f;--ink2:#4b5563;--mut:#8a93a1;--line:#e3e6eb;--blue:#2a6fdb;--ok:#1a8f4c;--warn:#b86e00;--crit:#d6322e;--grid:#e9ecf0}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0e1116;--card:#171b22;--ink:#e8ebf0;--ink2:#a7afbc;--mut:#6f7886;--line:#262c36;--blue:#6aa3ff;--ok:#43c47a;--warn:#e5a23a;--crit:#ff6b66;--grid:#232933}}
+:root[data-theme=dark]{--bg:#0e1116;--card:#171b22;--ink:#e8ebf0;--ink2:#a7afbc;--mut:#6f7886;--line:#262c36;--blue:#6aa3ff;--ok:#43c47a;--warn:#e5a23a;--crit:#ff6b66;--grid:#232933}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}
+h1{font-size:18px;margin:0}
+.sub{color:var(--mut);font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;font-weight:600;font-size:13px;border:1px solid currentColor}
+.pill.ok{color:var(--ok)}.pill.warn{color:var(--warn)}.pill.crit{color:var(--crit)}
+.grid{display:grid;gap:12px}
+.tiles{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.tile .l{color:var(--ink2);font-size:12px}
+.tile .v{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
+.tile .v small{font-size:13px;color:var(--ink2);font-weight:500;margin-left:2px}
+.tile .s{color:var(--mut);font-size:11px;min-height:15px}
+.bar{height:6px;background:var(--grid);border-radius:3px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--blue);border-radius:3px}
+.charts{grid-template-columns:repeat(auto-fit,minmax(340px,1fr));margin-top:12px}
+.chart h3{margin:0 0 6px;font-size:13px;font-weight:600}
+.chart .cv{width:100%;height:190px}.chart h3{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.rd{font-weight:500;color:var(--ink2);font-size:12px;font-variant-numeric:tabular-nums}
+.ctl{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:14px 0 0}
+button,select,input{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:7px;padding:5px 10px}
+button{cursor:pointer}button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+h2{font-size:15px;margin:22px 0 8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--ink2);font-weight:600;font-size:12px}
+td.k{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink2);white-space:nowrap}
+.tbl{max-height:420px;overflow:auto}
+.lvl{font-weight:700}.lvl.crit{color:var(--crit)}.lvl.warn{color:var(--warn)}.lvl.ok{color:var(--ok)}.lvl.info{color:var(--blue)}
+.tip{position:fixed;pointer-events:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font-size:12px;box-shadow:0 4px 14px #0003;display:none;z-index:9}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+@keyframes flash{from{background:color-mix(in srgb,var(--blue) 24%,transparent)}to{background:transparent}}
+.chg{animation:flash .8s ease-out;border-radius:4px}
+.bar i{transition:width .5s ease}
+.spark{width:100%;height:22px;display:block;margin-top:4px}
+.dotl{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:1px}
+.dotl.live{animation:pulse 1.4s infinite}.dotl.stale{background:var(--warn)}.dotl.dead{background:var(--crit)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 60%,transparent)}100%{box-shadow:0 0 0 7px transparent}}
+@media(max-width:560px){.wrap{padding:12px}.tile .v{font-size:22px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div><h1 id="title">UPS Monitor</h1><div class="sub"><span class="dotl dead" id="dot"></span><span id="age">connecting…</span> · <span id="flags"></span></div></div>
+  <div style="display:flex;gap:8px;align-items:center"><span id="pill" class="pill warn">…</span><button id="theme" title="Toggle theme">◐</button></div>
+</header>
+
+<div class="grid tiles" id="tiles"></div>
+
+<div class="ctl" id="ranges"></div>
+<div class="grid charts" id="charts"></div>
+
+<div class="two">
+  <div><h2>Power outages</h2><div class="card tbl"><table id="outages"></table></div></div>
+  <div><h2>Last 24 h</h2><div class="card"><table id="day"></table></div></div>
+</div>
+
+<h2>Events</h2>
+<div class="card tbl"><table id="events"></table></div>
+
+<h2>Device &amp; all UPS variables</h2>
+<div class="ctl" style="margin-top:0"><input id="filter" placeholder="Filter variables…" style="min-width:240px"></div>
+<div class="card tbl" style="margin-top:8px"><table id="vars"></table></div>
+<p class="sub">Read-only view of every value the UPS reports through NUT. Prometheus metrics at <code>/metrics</code>.</p>
+</div>
+<div class="tip" id="tip"></div>
+
+<script src="/lwc.js"></script>
+<script>
+const $=s=>document.querySelector(s);
+const fmtDur=s=>{s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return (h?h+'h ':'')+(m||h?m+'m ':'')+x+'s'};
+const num=(v,k)=>{const x=parseFloat(v[k]);return isNaN(x)?null:x};
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let range=localStorage.getItem('range')||'24h', S=null, H=null;
+try{const t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t}catch(e){}
+$('#theme').onclick=()=>{const d=document.documentElement;const dark=getComputedStyle(d).getPropertyValue('--bg').trim()==='#0e1116';d.dataset.theme=dark?'light':'dark';try{localStorage.setItem('theme',d.dataset.theme)}catch(e){};restyleCharts()};
+
+const CH=[
+ {id:'charge',t:'Battery charge (%)',k:'charge',dec:0,min:0,max:100,u:'%'},
+ {id:'runtime',t:'Estimated runtime (min)',k:'runtime',f:v=>v/60,u:' min',min:0},
+ {id:'load',t:'Load (%)',k:'load',dec:0,min:0,max:100,u:'%'},
+ {id:'watts',t:'Power draw (W, estimated)',k:'watts',dec:0,min:0,u:' W'},
+ {id:'in_v',t:'Input voltage (V, dashed = min/max)',k:'in_v',band:['in_min','in_max'],u:' V'},
+ {id:'out_v',t:'Output voltage (V)',k:'out_v',u:' V'},
+ {id:'batt_v',t:'Battery voltage (V)',k:'batt_v',dec:2,u:' V'},
+ {id:'freq',t:'Input frequency (Hz)',k:'freq',u:' Hz'},
+];
+
+const TILES={},SPK={};
+function ensureTile(id,label){
+  if(TILES[id])return TILES[id];
+  const d=document.createElement('div');d.className='card tile';
+  d.innerHTML=`<div class="l">${label}</div><div class="v"><span class="n">–</span><small></small></div><div class="s"></div><div class="bar" style="display:none"><i></i></div><svg class="spark" viewBox="0 0 100 22" preserveAspectRatio="none" style="display:none"><polyline fill="none" stroke="var(--blue)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+  $('#tiles').appendChild(d);
+  return TILES[id]={d,n:d.querySelector('.n'),u:d.querySelector('small'),s:d.querySelector('.s'),bar:d.querySelector('.bar'),bi:d.querySelector('.bar i'),sp:d.querySelector('.spark'),pl:d.querySelector('polyline'),val:null};
+}
+function setTile(id,label,val,unit,sub,pct,spark){
+  const t=ensureTile(id,label),txt=String(val);
+  if(t.val!==null&&t.val!==txt){t.n.classList.remove('chg');void t.n.offsetWidth;t.n.classList.add('chg')}
+  t.val=txt;t.n.textContent=txt;t.u.textContent=unit||'';if(t.s.textContent!==(sub||''))t.s.textContent=sub||'';
+  if(pct!=null){t.bar.style.display='';t.bi.style.width=Math.max(0,Math.min(100,pct))+'%'}
+  if(spark!=null&&!isNaN(spark)){const a=SPK[id]=SPK[id]||[];a.push(spark);if(a.length>150)a.shift();
+    if(a.length>2){const lo0=Math.min(...a),hi0=Math.max(...a),mid=(lo0+hi0)/2,r=Math.max(hi0-lo0,Math.abs(mid)*0.04,0.5),lo=mid-r/2;t.sp.style.display='';
+      t.pl.setAttribute('points',a.map((y,i)=>`${(i/(a.length-1)*100).toFixed(1)},${(20-(y-lo)/r*18).toFixed(1)}`).join(' '))}}
+}
+let lastMsg=0;
+function renderState(){
+  const v=S.vars||{};
+  $('#title').textContent=(v['ups.model']||v['device.model']||'UPS')+(S.desc&&S.desc!=='Unavailable'?' · '+S.desc:'');
+  let cls='ok',txt='ONLINE';
+  if(!S.ok){cls='crit';txt='NO LINK'}
+  else{
+    const st=(v['ups.status']||'').split(' ');
+    if(st.includes('OB')){cls='crit';txt=st.includes('LB')?'LOW BATTERY':'ON BATTERY'}
+    else if(st.includes('OVER')||st.includes('RB')||st.includes('ALARM')){cls='warn';txt=st.includes('RB')?'REPLACE BATTERY':st.includes('OVER')?'OVERLOAD':'ALARM'}
+    else if(st.includes('CHRG')){txt='ONLINE · CHARGING'}
+  }
+  $('#pill').className='pill '+cls;$('#pill').textContent=txt;
+  const flags=Object.entries(S.flags||{});
+  $('#flags').textContent=(v['ups.status']||'')+' · '+flags.map(f=>f[1][0]).join(', ')+(S.telegram?' · Telegram on':' · Telegram off');
+  const rt=num(v,'battery.runtime'), w=S.derived&&S.derived.watts;
+  setTile('charge','Battery charge',v['battery.charge']??'–','%',`low-battery flag at ${v['battery.charge.low']??'?'}%`,num(v,'battery.charge'));
+  setTile('runtime','Runtime left',rt!=null?(rt/60).toFixed(1):'–','min',rt!=null?fmtDur(rt):'',null,rt!=null?rt/60:null);
+  setTile('load','Load',v['ups.load']??'–','%',w!=null?`≈ ${w} W of ${v['ups.realpower.nominal']||'?'} W`:'',num(v,'ups.load'),num(v,'ups.load'));
+  setTile('watts','Power draw',w??'–','W','estimated from load × rated power',null,w);
+  setTile('inv','Input voltage',v['input.voltage']??'–','V',v['input.transfer.low']?`transfer window ${v['input.transfer.low']}–${v['input.transfer.high']} V`:'',null,num(v,'input.voltage'));
+  if(v['output.voltage'])setTile('outv','Output voltage',v['output.voltage'],'V',v['output.frequency']?v['output.frequency']+' Hz':'',null,num(v,'output.voltage'));
+  setTile('battv','Battery voltage',v['battery.voltage']??'–','V',v['battery.voltage.nominal']?`nominal ${v['battery.voltage.nominal']} V`:'',null,num(v,'battery.voltage'));
+  if(v['input.frequency'])setTile('freq','Frequency',v['input.frequency'],'Hz','',null,num(v,'input.frequency'));
+  if(v['ups.temperature'])setTile('temp','Temperature',v['ups.temperature'],'°C','',null,num(v,'ups.temperature'));
+  renderDay();
+  renderVars();
+  liveChartPoint();
+}
+function renderDay(){
+  const d=S.day||{};
+  setTile('kwh','Energy (24 h)',d.kwh!=null?d.kwh.toFixed(2):'–','kWh',S.price&&d.kwh!=null?`≈ ${(d.kwh*S.price).toFixed(2)} ${S.currency}`:'integrated from load');
+  setTile('outs','Outages (24 h)',d.outages??0,'',d.outage_s?fmtDur(d.outage_s)+' on battery':'none');
+  $('#day').innerHTML=[['Lowest input',d.min_in!=null?d.min_in.toFixed(0)+' V':'–'],['Highest input',d.max_in!=null?d.max_in.toFixed(0)+' V':'–'],['Average load',d.avg_load!=null?d.avg_load.toFixed(1)+' %':'–'],['Peak load',d.max_load!=null?d.max_load+' %':'–'],['Lowest charge',d.min_charge!=null?d.min_charge.toFixed(0)+' %':'–'],['Samples',d.samples]].map(r=>`<tr><td class="k">${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+}
+function tickAge(){
+  const age=lastMsg?(performance.now()-lastMsg)/1000:99,d=$('#dot'),l=$('#age');
+  const live=age<4&&S&&S.ok;
+  d.className='dotl '+(live?'live':age<15?'stale':'dead');
+  l.textContent=live?'live':age<15?`delayed ${Math.round(age)}s`:(S&&!S.ok?'no link to UPS':'reconnecting…');
+}
+setInterval(tickAge,500);
+let lastVars=0;
+function renderVars(force){
+  if(!S)return;if(!force&&performance.now()-lastVars<5000)return;lastVars=performance.now();const f=$('#filter').value.toLowerCase();
+  const rows=Object.entries(S.vars||{}).filter(([k,x])=>!f||k.includes(f)||String(x).toLowerCase().includes(f)).sort();
+  const extra=[];
+  if(S.cmds&&S.cmds.length)extra.push(['<instant commands>',S.cmds.join(', ')]);
+  $('#vars').innerHTML='<tr><th>Variable</th><th>Value</th></tr>'+rows.concat(extra).map(([k,x])=>`<tr><td class="k">${esc(k)}</td><td>${esc(x)}${S.rw&&S.rw[k]!==undefined?' <span class="sub">(writable)</span>':''}</td></tr>`).join('');
+}
+$('#filter').oninput=()=>renderVars(true);
+
+function renderRanges(){
+  $('#ranges').innerHTML=['1h','6h','24h','7d','30d','90d','1y'].map(r=>`<button class="${r===range?'on':''}" data-r="${r}">${r}</button>`).join('')+'<span class="sub" style="margin-left:8px">History</span>';
+  document.querySelectorAll('#ranges button').forEach(b=>b.onclick=()=>{range=b.dataset.r;try{localStorage.setItem('range',range)}catch(e){};renderRanges();loadHist(true)});
+}
+
+const cv=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const tzo=()=>-new Date().getTimezoneOffset()*60;
+let CHARTS=[],syncing=false;
+function themeOpts(){return {layout:{background:{type:'solid',color:cv('--card')},textColor:cv('--ink2'),fontSize:11,attributionLogo:false},
+  grid:{vertLines:{color:cv('--grid')},horzLines:{color:cv('--grid')}},rightPriceScale:{borderColor:cv('--line')},
+  timeScale:{borderColor:cv('--line'),timeVisible:true,secondsVisible:false},crosshair:{mode:0}}}
+function buildCharts(){
+  const box=$('#charts');box.innerHTML='';CHARTS=[];
+  const L=LightweightCharts;
+  CH.forEach(c=>{
+    const card=document.createElement('div');card.className='card chart';
+    card.innerHTML=`<h3><span>${c.t}</span><span class="rd" id="rd_${c.id}"></span></h3><div class="cv" id="cv_${c.id}"></div>`;
+    box.appendChild(card);
+    const el=card.querySelector('.cv');
+    const chart=L.createChart(el,{...themeOpts(),autoSize:true,height:190,localization:{priceFormatter:p=>p.toFixed(c.dec??1)}});
+    const bat=chart.addSeries(L.HistogramSeries,{priceScaleId:'ob',priceLineVisible:false,lastValueVisible:false,color:'rgba(214,50,46,.18)',base:0});
+    chart.priceScale('ob').applyOptions({scaleMargins:{top:0,bottom:0},visible:false});
+    let band=null;
+    if(c.band){band=[chart.addSeries(L.LineSeries,{color:cv('--mut'),lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false}),
+                     chart.addSeries(L.LineSeries,{color:cv('--mut'),lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false})]}
+    const line=chart.addSeries(L.LineSeries,{color:cv('--blue'),lineWidth:2,priceLineVisible:false,lastValueVisible:true});
+    if(c.min!=null||c.max!=null)line.applyOptions({autoscaleInfoProvider:orig=>{const r=orig();if(!r)return r;if(c.min!=null)r.priceRange.minValue=c.min;if(c.max!=null)r.priceRange.maxValue=c.max;return r}});
+    chart.subscribeCrosshairMove(p=>{
+      const rd=$('#rd_'+c.id),v=p.seriesData&&p.seriesData.get(line);
+      if(v)rd.textContent=v.value.toFixed(c.dec??1)+c.u+'  ·  '+new Date((p.time-tzo())*1000).toLocaleString();else rd.textContent='';
+      if(syncing)return;syncing=true;
+      CHARTS.forEach(o=>{if(o.chart===chart)return;if(p.time!==undefined&&p.time!==null&&o.last)o.chart.setCrosshairPosition(NaN,p.time,o.line);else o.chart.clearCrosshairPosition()});
+      syncing=false});
+    chart.timeScale().subscribeVisibleLogicalRangeChange(r=>{if(syncing||!r)return;syncing=true;CHARTS.forEach(o=>{if(o.chart!==chart)o.chart.timeScale().setVisibleLogicalRange(r)});syncing=false});
+    CHARTS.push({c,chart,line,bat,band,last:false});
+  });
+}
+function drawCharts(fit){
+  if(!H)return;
+  if(!CHARTS.length)buildCharts();
+  const ci=Object.fromEntries(H.cols.map((x,i)=>[x,i])),off=tzo();
+  CHARTS.forEach(o=>{
+    const {c}=o,rows=H.rows.filter(r=>r[ci[c.k]]!=null);
+    o.last=rows.length>0;o.chart.chartElement().closest('.card').style.display=rows.length?'':'none';
+    const t=r=>r[0]+off;
+    o.line.setData(rows.map(r=>({time:t(r),value:c.f?c.f(r[ci[c.k]]):r[ci[c.k]]})));
+    o.bat.setData(H.rows.map(r=>({time:t(r),value:r[ci.onbatt]?1:0})));
+    if(o.band){o.band[0].setData(rows.map(r=>({time:t(r),value:r[ci[c.band[0]]]})));o.band[1].setData(rows.map(r=>({time:t(r),value:r[ci[c.band[1]]]})))}
+    if(fit!==false){o.chart.timeScale().fitContent();requestAnimationFrame(()=>o.chart.timeScale().fitContent());setTimeout(()=>o.chart.timeScale().fitContent(),200)}
+  });
+}
+let lastLive=0;
+function liveChartPoint(){
+  if(!H||!CHARTS.length||!S||!S.ok||!['1h','6h'].includes(range))return;
+  const now=performance.now();if(now-lastLive<5000)return;lastLive=now;
+  const v=S.vars,d=S.derived||{},t=Math.floor(Date.now()/1000)+tzo();
+  const val={charge:num(v,'battery.charge'),runtime:num(v,'battery.runtime'),load:num(v,'ups.load'),watts:d.watts,in_v:num(v,'input.voltage'),out_v:num(v,'output.voltage'),batt_v:num(v,'battery.voltage'),freq:num(v,'input.frequency')};
+  const ob=(v['ups.status']||'').split(' ').includes('OB')?1:0;
+  CHARTS.forEach(o=>{const x=val[o.c.k];if(x==null||!o.last)return;
+    try{o.line.update({time:t,value:o.c.f?o.c.f(x):x});o.bat.update({time:t,value:ob});
+      if(o.band){o.band[0].update({time:t,value:x});o.band[1].update({time:t,value:x})}}catch(e){}})
+}
+function restyleCharts(){CHARTS.forEach(o=>{o.chart.applyOptions(themeOpts());o.line.applyOptions({color:cv('--blue')});if(o.band)o.band.forEach(b=>b.applyOptions({color:cv('--mut')}))})}
+async function j(u){const r=await fetch(u);return r.json()}
+async function loadState(){try{const d=await j('/api/state');S={...(S||{}),...d};renderState()}catch(e){}}
+async function loadHist(fit){try{H=await j('/api/history?range='+range);drawCharts(fit)}catch(e){}}
+async function loadEvents(){try{
+  const e=await j('/api/events');
+  $('#events').innerHTML='<tr><th>Time</th><th>Event</th><th>Detail</th></tr>'+(e.events.map(r=>`<tr><td>${new Date(r[0]*1000).toLocaleString()}</td><td class="lvl ${r[1]}">${esc(r[2])}</td><td>${esc(r[3]).replace(/\n/g,'<br>')}</td></tr>`).join('')||'<tr><td colspan=3>No events yet</td></tr>');
+  $('#outages').innerHTML='<tr><th>Start</th><th>Duration</th><th>Charge</th><th>Min in V</th><th>Peak load</th></tr>'+(e.outages.map(r=>`<tr><td>${new Date(r[0]*1000).toLocaleString()}</td><td>${r[1]?fmtDur(r[1]-r[0]):'<b class="lvl crit">ongoing</b>'}</td><td>${r[6]??'?'}→${r[7]??(r[2]??'?')}%</td><td>${r[5]!=null&&r[5]<1e8?r[5].toFixed(0):'–'}</td><td>${r[4]!=null?r[4]+'%':'–'}</td></tr>`).join('')||'<tr><td colspan=5>No outages recorded 🎉</td></tr>');
+}catch(e){}}
+renderRanges();loadState().then(()=>{loadHist();loadEvents()});
+function connect(){
+  const es=new EventSource('/api/stream');
+  es.onmessage=e=>{const m=JSON.parse(e.data);lastMsg=performance.now();const prevStatus=S&&S.vars&&S.vars['ups.status'];S={...(S||{}),...m};renderState();
+    if(prevStatus!==undefined&&prevStatus!==m.vars['ups.status'])loadEvents()};
+  es.onerror=()=>{tickAge()};
+}
+connect();
+setInterval(loadState,30000);                       // 24 h stats, device info
+setInterval(()=>loadHist(false),20000);
+setInterval(loadEvents,15000);
+matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>setTimeout(restyleCharts,50));
+</script>
+</body>
+</html>

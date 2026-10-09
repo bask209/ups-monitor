@@ -1,0 +1,31 @@
+[Unit]
+Description=NUT driver + upsd for the APC USB UPS
+
+[Container]
+ContainerName=ups-nut
+Image=localhost/ups-monitor:latest
+Pull=never
+Pod=ups.pod
+Exec=/usr/local/bin/nut-entrypoint
+AddDevice=/dev/bus/usb:/dev/bus/usb
+# USB device nodes carry usb_device_t, which the default container label cannot open
+SecurityLabelDisable=true
+NoNewPrivileges=true
+DropCapability=all
+AddCapability=SETUID SETGID
+Tmpfs=/var/run/nut
+Tmpfs=/tmp
+HealthCmd=upsc ups@127.0.0.1 ups.status
+HealthInterval=30s
+HealthTimeout=10s
+HealthRetries=3
+HealthStartPeriod=30s
+HealthOnFailure=kill
+PodmanArgs=--memory=128m --pids-limit=64
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

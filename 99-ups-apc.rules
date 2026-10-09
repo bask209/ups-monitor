@@ -1,0 +1,2 @@
+# Let the user (rootless podman) talk to the APC USB UPS
+SUBSYSTEM=="usb", ATTRS{idVendor}=="051d", ATTRS{idProduct}=="0002", OWNER="vicnas", GROUP="vicnas", MODE="0660"
