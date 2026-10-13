@@ -16,7 +16,9 @@ NUT_PORT = int(os.environ.get("NUT_PORT", "3493"))
 UPS = os.environ.get("NUT_UPS", "ups")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8330"))
 DB_PATH = os.environ.get("DB_PATH", "/data/ups.db")
-POLL = float(os.environ.get("POLL_SECONDS", "1"))
+POLL = float(os.environ.get("POLL_SECONDS", "1"))  # full refresh of every UPS variable
+FAST = float(os.environ.get("FAST_POLL_SECONDS", "0.2"))  # status + input voltage, to catch very short blips
+VSAG_PCT = float(os.environ.get("VOLTAGE_ALERT_PCT", "10"))  # alert when input leaves nominal +/- this %
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "365"))  # how long history is kept
 RAW_DAYS = int(os.environ.get("RAW_DAYS", "30"))  # full 10 s resolution; older data is rolled up to 1 min
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
@@ -143,10 +145,12 @@ def init_db():
         tries INTEGER DEFAULT 0, next_try INTEGER DEFAULT 0, sent_at INTEGER, msg_id INTEGER, error TEXT);
     CREATE INDEX IF NOT EXISTS ev_ts ON events(ts);
     """)
-    try:
-        conn.execute("ALTER TABLE events ADD COLUMN notified TEXT")
-    except sqlite3.OperationalError:
-        pass  # column already there
+    for stmt in ("ALTER TABLE events ADD COLUMN notified TEXT", "ALTER TABLE samples ADD COLUMN in_min REAL",
+                 "ALTER TABLE samples ADD COLUMN in_max REAL"):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already there
     conn.commit()
 
 
@@ -491,6 +495,21 @@ class Tracker:
         else:
             add_event("info", "Monitor started", f"Status {fl}", notify=False)
 
+    def check_voltage(self, v, vmin, vmax):
+        """Mains sag/surge seen between samples, even when the UPS never transferred to battery."""
+        nom = num(v, "input.voltage.nominal") or 120.0
+        lo, hi = nom * (1 - VSAG_PCT / 100), nom * (1 + VSAG_PCT / 100)
+        if vmin is None or "OB" in v.get("ups.status", "").split():
+            return
+        bad = vmin < lo or vmax > hi
+        t = time.time()
+        if bad and t - getattr(self, "last_vevent", 0) > 120:
+            self.last_vevent = t
+            what = "sag" if vmin < lo else "surge"
+            add_event("warn", f"Mains voltage {what}",
+                      f"Input dipped to {vmin:.0f} V / peaked at {vmax:.0f} V within 10 s (normal {nom:.0f} V, alert outside {lo:.0f}-{hi:.0f} V). "
+                      f"The UPS did not switch to battery.")
+
     def start_outage(self, now, charge, inv):
         with dblock:
             cur = conn.execute("INSERT INTO outages(start,charge_start,min_in_v) VALUES(?,?,?)", (now, charge, inv))
@@ -505,8 +524,29 @@ class Tracker:
             row = conn.execute("SELECT min_charge FROM outages WHERE id=?", (self.outage_id,)).fetchone()
             conn.execute("UPDATE outages SET end=?, charge_end=? WHERE id=?", (now, charge, self.outage_id))
             conn.commit()
-        add_event("ok", "Power restored", f"Outage lasted {fmt_dur(now - start)}.\nLowest charge {row[0]}%, now {charge}%.")
+        dur = now - start
+        add_event("ok", "Power restored", (f"Outage lasted {fmt_dur(dur)}." if dur >= 3 else "Very brief blip (under 3 s): the UPS switched to battery and back.")
+                  + f"\nLowest charge {row[0]}%, now {charge}%.")
         self.outage_id = None
+
+
+class FastLink:
+    """One persistent NUT connection for cheap GET VAR queries (a few per second)."""
+
+    def __init__(self):
+        self.s = socket.create_connection((NUT_HOST, NUT_PORT), timeout=5)
+        self.s.settimeout(5)
+        self.f = self.s.makefile("r")
+
+    def get(self, var):
+        l = nut_cmd(self.f, self.s, f"GET VAR {UPS} {var}")[0]
+        return unq(l.split(" ", 3)[3])
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
 
 
 def poller():
@@ -517,43 +557,68 @@ def poller():
     if r:
         tr.outage_id = r[0]
     fails = 0
-    last_store = 0
-    last_extra = 0
+    last_store = last_extra = last_full = 0
+    fast = None
+    last_status = None
+    wmin = wmax = None  # input-voltage extremes seen since the last stored sample
     while True:
+        err = False
         try:
-            want_extra = time.time() - last_extra > 60 or not state["desc"]
-            v, rw, cmds, desc = nut_fetch(want_extra)
-            if want_extra:
-                last_extra = time.time()
-            with lock:
-                was_ok = state["ok"]
-                state.update(vars=v, ok=True, err="", ts=time.time(), ver=state["ver"] + 1)
+            if fast is None:
+                fast = FastLink()
+            st = fast.get("ups.status")
+            try:
+                iv = float(fast.get("input.voltage"))
+                wmin = iv if wmin is None else min(wmin, iv)
+                wmax = iv if wmax is None else max(wmax, iv)
+            except (ValueError, RuntimeError):
+                pass
+            now_t = time.time()
+            changed = last_status is not None and st != last_status
+            last_status = st
+            if changed or now_t - last_full >= POLL or fails:
+                last_full = now_t
+                want_extra = now_t - last_extra > 60 or not state["desc"]
+                v, rw, cmds, desc = nut_fetch(want_extra)
                 if want_extra:
-                    state.update(rw=rw, cmds=cmds, desc=desc)
-                cond.notify_all()
-            if not was_ok and fails >= 3:
-                add_event("ok", "UPS link restored", "Communication with the UPS is back.")
-            fails = 0
-            tr.feed(v)
-            now = int(time.time())
-            if now - last_store >= 10:
-                last_store = now
-                d = derive(v)
-                flags = v.get("ups.status", "")
-                with dblock:
-                    conn.execute("INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
-                        now, num(v, "battery.charge"), num(v, "battery.runtime"), num(v, "ups.load"), d["watts"],
-                        num(v, "input.voltage"), num(v, "output.voltage"), num(v, "battery.voltage"),
-                        num(v, "input.frequency"), num(v, "ups.temperature"), 1 if "OB" in flags.split() else 0, flags))
-                    conn.commit()
+                    last_extra = now_t
+                with lock:
+                    was_ok = state["ok"]
+                    state.update(vars=v, ok=True, err="", ts=time.time(), ver=state["ver"] + 1)
+                    if want_extra:
+                        state.update(rw=rw, cmds=cmds, desc=desc)
+                    cond.notify_all()
+                if not was_ok and fails >= 3:
+                    add_event("ok", "UPS link restored", "Communication with the UPS is back.")
+                fails = 0
+                tr.feed(v)
+                now = int(time.time())
+                if now - last_store >= 10:
+                    last_store = now
+                    d = derive(v)
+                    flags = v.get("ups.status", "")
+                    tr.check_voltage(v, wmin, wmax)
+                    with dblock:
+                        conn.execute("INSERT OR REPLACE INTO samples(ts,charge,runtime,load,watts,in_v,out_v,batt_v,freq,temp,onbatt,status,in_min,in_max)"
+                                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                            now, num(v, "battery.charge"), num(v, "battery.runtime"), num(v, "ups.load"), d["watts"],
+                            num(v, "input.voltage"), num(v, "output.voltage"), num(v, "battery.voltage"),
+                            num(v, "input.frequency"), num(v, "ups.temperature"), 1 if "OB" in flags.split() else 0, flags,
+                            wmin, wmax))
+                        conn.commit()
+                    wmin = wmax = None
         except Exception as e:
+            err = True
             fails += 1
+            if fast:
+                fast.close()
+            fast = None
             with lock:
                 state.update(ok=False, err=str(e), ver=state["ver"] + 1)
                 cond.notify_all()
             if fails == 3:
                 add_event("crit", "UPS link lost", f"Cannot read the UPS driver: {e}")
-        time.sleep(POLL)
+        time.sleep(1 if err else FAST)
 
 
 def rollup_and_prune():
@@ -562,7 +627,7 @@ def rollup_and_prune():
     raw_cut = (now - RAW_DAYS * 86400) // 60 * 60
     with dblock:
         conn.execute("""INSERT OR REPLACE INTO samples_1m SELECT ts/60*60, AVG(charge),AVG(runtime),AVG(load),AVG(watts),
-            AVG(in_v),AVG(out_v),AVG(batt_v),AVG(freq),AVG(temp),MAX(onbatt),MIN(in_v),MAX(in_v)
+            AVG(in_v),AVG(out_v),AVG(batt_v),AVG(freq),AVG(temp),MAX(onbatt),MIN(COALESCE(in_min,in_v)),MAX(COALESCE(in_max,in_v))
             FROM samples WHERE ts<? GROUP BY ts/60""", (raw_cut,))
         conn.execute("DELETE FROM samples WHERE ts<?", (raw_cut,))
         conn.execute("DELETE FROM samples_1m WHERE ts<?", (now - RETENTION_DAYS * 86400,))
@@ -600,7 +665,7 @@ def api_history(rng):
             AVG(out_v),AVG(batt_v),AVG(freq),AVG(temp),MAX(onbatt) FROM (
               SELECT ts,charge,runtime,load,watts,in_v,in_min,in_max,out_v,batt_v,freq,temp,onbatt FROM samples_1m WHERE ts>=?
               UNION ALL
-              SELECT ts,charge,runtime,load,watts,in_v,in_v,in_v,out_v,batt_v,freq,temp,onbatt FROM samples WHERE ts>=?)
+              SELECT ts,charge,runtime,load,watts,in_v,COALESCE(in_min,in_v),COALESCE(in_max,in_v),out_v,batt_v,freq,temp,onbatt FROM samples WHERE ts>=?)
             GROUP BY b ORDER BY b""", (bucket, bucket, since, since)).fetchall()
     cols = ["t", "charge", "runtime", "load", "watts", "in_v", "in_min", "in_max", "out_v", "batt_v", "freq", "temp", "onbatt"]
     return {"cols": cols, "rows": [[round(x, 2) if isinstance(x, float) else x for x in r] for r in rows],
