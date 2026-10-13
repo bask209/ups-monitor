@@ -235,7 +235,7 @@ async function loadState(){try{const d=await j('/api/state');S={...(S||{}),...d}
 async function loadHist(fit){try{H=await j('/api/history?range='+range);drawCharts(fit)}catch(e){}}
 async function loadEvents(){try{
   const e=await j('/api/events');
-  $('#events').innerHTML='<tr><th>Time</th><th>Event</th><th>Detail</th></tr>'+(e.events.map(r=>`<tr><td>${new Date(r[0]*1000).toLocaleString()}</td><td class="lvl ${r[1]}">${esc(r[2])}</td><td>${esc(r[3]).replace(/\n/g,'<br>')}</td></tr>`).join('')||'<tr><td colspan=3>No events yet</td></tr>');
+  $('#events').innerHTML='<tr><th>Time</th><th>Event</th><th>Detail</th><th title="Telegram delivery">TG</th></tr>'+(e.events.map(r=>`<tr><td>${new Date(r[0]*1000).toLocaleString()}</td><td class="lvl ${r[1]}">${esc(r[2])}</td><td>${esc(r[3]).replace(/\n/g,'<br>')}</td><td title="${r[4]||'not sent (info only)'}">${{sent:'✓',pending:'⏳',failed:'✗'}[r[4]]||''}</td></tr>`).join('')||'<tr><td colspan=4>No events yet</td></tr>');
   $('#outages').innerHTML='<tr><th>Start</th><th>Duration</th><th>Charge</th><th>Min in V</th><th>Peak load</th></tr>'+(e.outages.map(r=>`<tr><td>${new Date(r[0]*1000).toLocaleString()}</td><td>${r[1]?fmtDur(r[1]-r[0]):'<b class="lvl crit">ongoing</b>'}</td><td>${r[6]??'?'}→${r[7]??(r[2]??'?')}%</td><td>${r[5]!=null&&r[5]<1e8?r[5].toFixed(0):'–'}</td><td>${r[4]!=null?r[4]+'%':'–'}</td></tr>`).join('')||'<tr><td colspan=5>No outages recorded 🎉</td></tr>');
 }catch(e){}}
 renderRanges();loadState().then(()=>{loadHist();loadEvents()});

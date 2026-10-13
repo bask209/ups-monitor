@@ -5,6 +5,7 @@ import socket
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -138,8 +139,14 @@ def init_db():
     CREATE TABLE IF NOT EXISTS outages(id INTEGER PRIMARY KEY AUTOINCREMENT, start INTEGER, end INTEGER,
         min_charge REAL, min_runtime REAL, max_load REAL, min_in_v REAL, charge_start REAL, charge_end REAL);
     CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER, ts INTEGER, text TEXT,
+        tries INTEGER DEFAULT 0, next_try INTEGER DEFAULT 0, sent_at INTEGER, msg_id INTEGER, error TEXT);
     CREATE INDEX IF NOT EXISTS ev_ts ON events(ts);
     """)
+    try:
+        conn.execute("ALTER TABLE events ADD COLUMN notified TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already there
     conn.commit()
 
 
@@ -158,12 +165,74 @@ def kv_set(k, v):
 def add_event(level, kind, msg, notify=True):
     ts = int(time.time())
     with dblock:
-        conn.execute("INSERT INTO events(ts,level,kind,msg) VALUES(?,?,?,?)", (ts, level, kind, msg))
+        cur = conn.execute("INSERT INTO events(ts,level,kind,msg) VALUES(?,?,?,?)", (ts, level, kind, msg))
         conn.commit()
+        eid = cur.lastrowid
     print(f"[{level}] {kind}: {msg}", flush=True)
     if notify:
         icon = {"crit": "🚨", "warn": "⚠️", "ok": "✅", "info": "ℹ️"}.get(level, "•")
-        tg_send(f"{icon} <b>{kind}</b>\n{msg}")
+        enqueue(f"{icon} <b>{kind}</b>\n{msg}", eid)
+
+
+def enqueue(text, event_id=None):
+    """Queue an alert. It is stored first, then a sender thread delivers it, retrying until Telegram accepts it."""
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    with dblock:
+        conn.execute("INSERT INTO outbox(event_id,ts,text) VALUES(?,?,?)", (event_id, int(time.time()), text))
+        if event_id:
+            conn.execute("UPDATE events SET notified='pending' WHERE id=?", (event_id,))
+        conn.commit()
+
+
+def outbox_loop():
+    """Deliver queued alerts in order. Backs off while Telegram or the internet is unreachable and never drops
+    an alert (only gives up after 24 h or on a permanent Telegram error)."""
+    while True:
+        try:
+            now = int(time.time())
+            with dblock:
+                row = conn.execute("SELECT id,event_id,ts,text,tries FROM outbox WHERE sent_at IS NULL AND error IS NULL "
+                                   "AND next_try<=? ORDER BY id LIMIT 1", (now,)).fetchone()
+            if not row:
+                time.sleep(2)
+                continue
+            oid, eid, ts, text, tries = row
+            if now - ts > 86400:
+                with dblock:
+                    conn.execute("UPDATE outbox SET error='expired' WHERE id=?", (oid,))
+                    conn.execute("UPDATE events SET notified='failed' WHERE id=?", (eid,))
+                    conn.commit()
+                continue
+            if now - ts > 90:  # sent late (e.g. internet was down): say when it really happened
+                text = f"⏱ <i>Delayed alert - happened {datetime.fromtimestamp(ts).strftime('%a %H:%M:%S')}</i>\n" + text
+            try:
+                r = tg_api("sendMessage", chat_id=TG_CHAT, text=text, parse_mode="HTML", disable_web_page_preview=True)
+                mid = r["result"]["message_id"]
+                with dblock:
+                    conn.execute("UPDATE outbox SET sent_at=?, msg_id=? WHERE id=?", (int(time.time()), mid, oid))
+                    conn.execute("UPDATE events SET notified='sent' WHERE id=?", (eid,))
+                    conn.commit()
+                print(f"telegram sent: message_id={mid} (queued {int(time.time()) - ts}s, tries {tries + 1})", flush=True)
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 401, 403, 404):  # permanent: bad chat/token/markup
+                    with dblock:
+                        conn.execute("UPDATE outbox SET error=? WHERE id=?", (f"HTTP {e.code}", oid))
+                        conn.execute("UPDATE events SET notified='failed' WHERE id=?", (eid,))
+                        conn.commit()
+                    print(f"telegram send rejected: HTTP {e.code} {e.read()[:200]!r}", flush=True)
+                else:
+                    raise
+        except Exception as e:
+            if "oid" in locals() and row:
+                delay = min(300, 5 * 2 ** min(tries, 6))
+                with dblock:
+                    conn.execute("UPDATE outbox SET tries=tries+1, next_try=? WHERE id=?", (int(time.time()) + delay, oid))
+                    conn.commit()
+                print(f"telegram send failed (retry in {delay}s, queued, attempt {tries + 1}): {e}", flush=True)
+            else:
+                print("outbox error:", e, flush=True)
+            time.sleep(2)
 
 
 # ---------------------------------------------------------------- Telegram
@@ -337,9 +406,7 @@ class Tracker:
         now = int(time.time())
         charge, rt, load, inv = num(v, "battery.charge"), num(v, "battery.runtime"), num(v, "ups.load"), num(v, "input.voltage")
         if self.prev_flags is None:
-            add_event("info", "Monitor started", f"Status {' '.join(sorted(flags))}", notify=False)
-            if "OB" in flags:
-                self.start_outage(now, charge, inv)
+            self.reconcile_start(flags, now, charge, rt, inv)
         else:
             on_now, on_prev = "OB" in flags, "OB" in self.prev_flags
             if on_now and not on_prev:
@@ -390,6 +457,39 @@ class Tracker:
         if tr and self.last_test is not None and tr != self.last_test:
             add_event("info", "Self-test result", tr)
         self.last_test = tr if tr else self.last_test
+
+    def reconcile_start(self, flags, now, charge, rt, inv):
+        """First reading after (re)start: close outages the previous run never finished, and report any blind gap."""
+        with dblock:
+            last = conn.execute("SELECT ts,status,charge FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
+        gap = now - last[0] if last else 0
+        was_ob = bool(last) and "OB" in last[1].split()
+        closed = False
+        if self.outage_id is not None:
+            if "OB" in flags:  # still on battery: carry on, without re-firing thresholds already crossed
+                self.low_notified = {th for th in (75, 50, 25, 10) if charge is not None and charge <= th}
+            else:
+                with dblock:
+                    st = conn.execute("SELECT start FROM outages WHERE id=?", (self.outage_id,)).fetchone()[0]
+                    lo = conn.execute("SELECT ts,charge FROM samples WHERE onbatt=1 AND ts>=? ORDER BY ts DESC LIMIT 1", (st,)).fetchone()
+                    conn.execute("UPDATE outages SET end=?, charge_end=? WHERE id=?",
+                                 (lo[0] if lo else st, lo[1] if lo else None, self.outage_id))
+                    conn.commit()
+                self.outage_id = None
+                closed = True
+        elif "OB" in flags:
+            self.start_outage(now, charge, inv)
+        fl = " ".join(sorted(flags))
+        if last and gap > 90:
+            t = lambda x: datetime.fromtimestamp(x).strftime("%a %H:%M:%S")
+            msg = (f"No readings from {t(last[0])} to {t(now)} ({fmt_dur(gap)}): the host or the monitor was down.\n"
+                   f"Last reading: {last[1]}, charge {last[2]}%.")
+            if was_ob:
+                msg += "\nIt was on battery - the host most likely lost power when the battery ran out."
+            msg += f"\nNow: {fl}, charge {charge}%."
+            add_event("crit" if was_ob else "warn", "Monitor back online after a gap", msg)
+        else:
+            add_event("info", "Monitor started", f"Status {fl}", notify=False)
 
     def start_outage(self, now, charge, inv):
         with dblock:
@@ -478,7 +578,7 @@ def maintenance():
             today = now.strftime("%Y-%m-%d")
             if DIGEST_ENABLED and now.hour >= DIGEST_HOUR and kv_get("digest_day") != today:
                 kv_set("digest_day", today)
-                tg_send(report_text("Daily digest (last 24 h)", int(time.time()) - 86400))
+                enqueue(report_text("Daily digest (last 24 h)", int(time.time()) - 86400))
             if time.time() - float(kv_get("maint_ts", 0)) > 6 * 3600:
                 rollup_and_prune()
                 kv_set("maint_ts", time.time())
@@ -530,7 +630,7 @@ def api_live():
 
 def api_events(n=200):
     with dblock:
-        ev = conn.execute("SELECT ts,level,kind,msg FROM events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+        ev = conn.execute("SELECT ts,level,kind,msg,notified FROM events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
         out = conn.execute("SELECT start,end,min_charge,min_runtime,max_load,min_in_v,charge_start,charge_end FROM outages ORDER BY id DESC LIMIT 50").fetchall()
     return {"events": ev, "outages": out}
 
@@ -617,7 +717,7 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
-    for fn in (poller, tg_loop, maintenance):
+    for fn in (poller, tg_loop, outbox_loop, maintenance):
         threading.Thread(target=fn, daemon=True).start()
     print(f"dashboard on :{HTTP_PORT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), H).serve_forever()
