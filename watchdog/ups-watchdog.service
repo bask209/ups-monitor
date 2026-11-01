@@ -1,0 +1,6 @@
+[Unit]
+Description=UPS monitor dead-man's switch (alerts and restarts the pod if the dashboard stops answering)
+
+[Service]
+Type=oneshot
+ExecStart=%h/ups-monitor/watchdog/ups-watchdog.sh

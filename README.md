@@ -38,6 +38,21 @@ user ID. The bot only answers that private chat (chat ID and sender ID must both
 (power failure/restore, battery thresholds, overload, replace battery, high load, mains voltage near limits, self-test
 results, link loss). Commands: `/status /day /week /events /outages /dashboard`. `DIGEST_ENABLED=true` adds a daily summary.
 
+## Staying alive (what watches the watcher)
+
+- `quadlet/ups.pod` has `Restart=always`. The pod is created with `--exit-policy stop`, so when both containers die
+  (e.g. a failed health check) it exits cleanly; the containers are `BindsTo=` the pod, so with `Restart=on-failure`
+  systemd stopped them and nothing ever restarted the stack (it was silently down for 8 h once).
+- `nut/entrypoint.sh` runs the driver and upsd in the foreground: driver logs reach `journalctl --user -u ups-nut`,
+  and if either process dies the container exits and is restarted.
+- The app persists "UPS link lost" in the DB, so a restart while the link is down still ends with a
+  "link restored after ..." message; it repeats "link STILL down" every `LINK_REMIND_SECONDS` (30 min), reports a
+  "Monitor was offline" gap on startup (`OFFLINE_ALERT_SECONDS`, 120), and restarts any worker thread that crashes.
+- `watchdog/` is a systemd user timer that runs outside the pod every minute. If `/api/health` does not answer for
+  3 minutes it sends a Telegram alert, starts/restarts `ups-pod.service`, and sends a message when it is back.
+  Install: `cp watchdog/ups-watchdog.{service,timer} ~/.config/systemd/user/ && systemctl --user daemon-reload &&
+  systemctl --user enable --now ups-watchdog.timer` (needs `TELEGRAM_*` in `.env`).
+
 ## Retention
 
 `RAW_DAYS` (default 30) at 10 s resolution, then 1-minute averages up to `RETENTION_DAYS` (default 365), roughly 50 MB.

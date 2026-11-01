@@ -5,6 +5,7 @@ import socket
 import sqlite3
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +27,8 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()  # public https URL for the Telegram Mini App
 DASH_URL = os.environ.get("DASHBOARD_URL", "").strip()  # LAN URL shown in messages
 LOAD_ALERT = float(os.environ.get("LOAD_ALERT_PCT", "80"))
+LINK_REMIND = float(os.environ.get("LINK_REMIND_SECONDS", "1800"))  # repeat "UPS link down" this often while it lasts
+OFFLINE_ALERT = float(os.environ.get("OFFLINE_ALERT_SECONDS", "120"))  # report a monitor gap longer than this
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 DIGEST_ENABLED = os.environ.get("DIGEST_ENABLED", "false").lower() in ("1", "true", "yes")  # off: alert only on events
 KWH_PRICE = os.environ.get("KWH_PRICE", "").strip()
@@ -557,6 +560,9 @@ def poller():
     if r:
         tr.outage_id = r[0]
     fails = 0
+    ds = kv_get("link_down_since", "")
+    down_since = float(ds) if ds else None  # set while the UPS link is considered lost; survives restarts
+    last_remind = time.time()
     last_store = last_extra = last_full = 0
     fast = None
     last_status = None
@@ -588,8 +594,12 @@ def poller():
                     if want_extra:
                         state.update(rw=rw, cmds=cmds, desc=desc)
                     cond.notify_all()
-                if not was_ok and fails >= 3:
-                    add_event("ok", "UPS link restored", "Communication with the UPS is back.")
+                if down_since is not None:
+                    # Persisted in the DB, so this also fires when the process was restarted while the link was down.
+                    add_event("ok", "UPS link restored",
+                              f"Communication with the UPS is back after {fmt_dur(time.time() - down_since)}.")
+                    down_since = None
+                    kv_set("link_down_since", "")
                 fails = 0
                 tr.feed(v)
                 now = int(time.time())
@@ -598,6 +608,7 @@ def poller():
                     d = derive(v)
                     flags = v.get("ups.status", "")
                     tr.check_voltage(v, wmin, wmax)
+                    kv_set("alive_ts", now)  # heartbeat: lets the next start tell how long the monitor was not running
                     with dblock:
                         conn.execute("INSERT OR REPLACE INTO samples(ts,charge,runtime,load,watts,in_v,out_v,batt_v,freq,temp,onbatt,status,in_min,in_max)"
                                      " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
@@ -616,8 +627,18 @@ def poller():
             with lock:
                 state.update(ok=False, err=str(e), ver=state["ver"] + 1)
                 cond.notify_all()
-            if fails == 3:
-                add_event("crit", "UPS link lost", f"Cannot read the UPS driver: {e}")
+            if fails >= 3:
+                now_t = time.time()
+                if down_since is None:
+                    down_since = now_t - fails  # roughly when the first failure happened (1 s retry)
+                    last_remind = now_t
+                    kv_set("link_down_since", down_since)
+                    add_event("crit", "UPS link lost", f"Cannot read the UPS driver: {e}")
+                elif now_t - last_remind >= LINK_REMIND:
+                    # One alert is easy to miss and says nothing about how long it has lasted.
+                    last_remind = now_t
+                    add_event("crit", "UPS link STILL down",
+                              f"No communication with the UPS for {fmt_dur(now_t - down_since)}: {e}")
         time.sleep(1 if err else FAST)
 
 
@@ -780,9 +801,36 @@ class H(BaseHTTPRequestHandler):
             self.send(json.dumps({"error": str(e)}), code=500)
 
 
+def supervised(fn):
+    """Run a worker forever. An uncaught exception used to end its thread silently while the web server kept
+    answering, leaving a dashboard that looked alive but no longer polled or alerted."""
+    def run():
+        while True:
+            try:
+                fn()
+            except BaseException:
+                print(f"thread {fn.__name__} crashed, restarting in 5 s:\n{traceback.format_exc()}", flush=True)
+            time.sleep(5)
+    return run
+
+
+def report_offline_gap():
+    """If the monitor was not running for a while (crash, host down, stack never restarted), say so on startup."""
+    last = kv_get("alive_ts")
+    if not last:
+        return
+    gap = time.time() - float(last)
+    if gap > OFFLINE_ALERT:
+        when = datetime.fromtimestamp(float(last)).strftime("%a %H:%M:%S")
+        add_event("warn", "Monitor was offline",
+                  f"The UPS monitor was not running for {fmt_dur(gap)} (last seen {when}). "
+                  "Outages or alerts during that time were not recorded.")
+
+
 if __name__ == "__main__":
     init_db()
+    report_offline_gap()
     for fn in (poller, tg_loop, outbox_loop, maintenance):
-        threading.Thread(target=fn, daemon=True).start()
+        threading.Thread(target=supervised(fn), name=fn.__name__, daemon=True).start()
     print(f"dashboard on :{HTTP_PORT}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), H).serve_forever()

@@ -2,5 +2,14 @@
 PodName=ups
 PublishPort=8330:8330
 
+[Service]
+# The pod is created with --exit-policy stop: when every container has exited
+# (e.g. both killed by a failed health check) the pod stops with exit status 0.
+# The containers are BindsTo= this unit, so systemd then stops them and cancels
+# their own Restart=always, leaving the whole stack down. Restart=on-failure
+# does not fire on a clean exit, so it must be Restart=always.
+Restart=always
+RestartSec=10
+
 [Install]
 WantedBy=default.target
