@@ -27,6 +27,10 @@ TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").strip()  # public https URL for the Telegram Mini App
 DASH_URL = os.environ.get("DASHBOARD_URL", "").strip()  # LAN URL shown in messages
 LOAD_ALERT = float(os.environ.get("LOAD_ALERT_PCT", "80"))
+# This UPS (Back-UPS BGM1500B-LM) now and then raises LB + RB for ~2 s while on mains at 100 % charge, with no
+# transfer to battery. Those flags only alert if they persist this long, or the moment the UPS is on battery.
+FLAG_DEBOUNCE = float(os.environ.get("FLAG_DEBOUNCE_SECONDS", "30"))
+DEBOUNCED_FLAGS = ("LB", "RB")
 LINK_REMIND = float(os.environ.get("LINK_REMIND_SECONDS", "1800"))  # repeat "UPS link down" this often while it lasts
 OFFLINE_ALERT = float(os.environ.get("OFFLINE_ALERT_SECONDS", "120"))  # report a monitor gap longer than this
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
@@ -401,6 +405,7 @@ def outages_text(n=8):
 class Tracker:
     def __init__(self):
         self.prev_flags = None
+        self.pending = {}  # debounced flag -> time first seen, not yet announced
         self.outage_id = None
         self.low_notified = set()
         self.load_high = False
@@ -422,10 +427,21 @@ class Tracker:
             elif on_prev and not on_now:
                 self.end_outage(now, charge)
             for f in sorted(flags - self.prev_flags - {"OL", "OB", "CHRG", "DISCHRG"}):
-                lvl = FLAGS.get(f, ("", "info"))[1]
-                add_event(lvl, f"Flag {f}", FLAGS.get(f, (f,))[0])
+                if f in DEBOUNCED_FLAGS and "OB" not in flags:
+                    self.pending[f] = now  # wait: it may be a momentary firmware glitch (see below)
+                    continue
+                self.announce_flag(f)
             for f in sorted(self.prev_flags - flags - {"OL", "OB", "CHRG", "DISCHRG"}):
-                add_event("ok", f"Cleared {f}", FLAGS.get(f, (f,))[0], notify=f in ("LB", "OVER", "RB", "ALARM"))
+                if f in self.pending:
+                    t0 = self.pending.pop(f)
+                    add_event("info", f"Brief {f}", f"{FLAGS.get(f, (f,))[0]} was reported for {now - t0} s while on mains "
+                              "and cleared by itself; not alerted (charge/runtime unaffected).", notify=False)
+                else:
+                    add_event("ok", f"Cleared {f}", FLAGS.get(f, (f,))[0], notify=f in ("LB", "OVER", "RB", "ALARM"))
+            for f, t0 in list(self.pending.items()):  # still set after the grace period, or we are now on battery
+                if f in flags and ("OB" in flags or now - t0 >= FLAG_DEBOUNCE):
+                    del self.pending[f]
+                    self.announce_flag(f)
         self.prev_flags = flags
 
         if self.outage_id is not None:
@@ -464,6 +480,9 @@ class Tracker:
         if tr and self.last_test is not None and tr != self.last_test:
             add_event("info", "Self-test result", tr)
         self.last_test = tr if tr else self.last_test
+
+    def announce_flag(self, f):
+        add_event(FLAGS.get(f, ("", "info"))[1], f"Flag {f}", FLAGS.get(f, (f,))[0])
 
     def reconcile_start(self, flags, now, charge, rt, inv):
         """First reading after (re)start: close outages the previous run never finished, and report any blind gap."""
